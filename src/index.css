@@ -1,0 +1,49 @@
+@import "tailwindcss";
+
+/*
+ * StudyNotes base styles
+ * - Automatically follows iPad Light/Dark system setting via prefers-color-scheme
+ * - Prevents accidental rubber-band overscroll on the outer app shell
+ * - Styles native <dialog> backdrops cleanly for iPad touch modals
+ */
+:root {
+  color-scheme: light dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Native HTML <dialog> modal backdrop & centering */
+dialog.sn-dialog {
+  margin: auto;
+  padding: 0;
+  border: none;
+  background: transparent;
+  max-width: min(92vw, 32rem);
+  width: 100%;
+  color: inherit;
+}
+
+dialog.sn-dialog::backdrop {
+  background: rgba(15, 23, 42, 0.45);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+/* Safe-area padding helpers for iPadOS Home Screen standalone mode */
+.safe-top {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+.safe-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
