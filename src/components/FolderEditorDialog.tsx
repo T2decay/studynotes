@@ -40,8 +40,7 @@ export function FolderEditorDialog({
       if (!dialog.open) {
         dialog.showModal();
       }
-      // Focus the text input so the iPad keyboard appears smoothly when creating/renaming
-      requestAnimationFrame(() => inputRef.current?.focus());
+      inputRef.current?.focus();
     } else if (dialog.open) {
       dialog.close();
     }

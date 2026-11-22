@@ -22,6 +22,17 @@ body,
   -webkit-tap-highlight-color: transparent;
 }
 
+/*
+ * WebKit / iPadOS Safari requires explicit user-select: text on inputs so an
+ * ancestor's select-none can never block tapping to open the on-screen keyboard.
+ */
+input,
+textarea {
+  -webkit-user-select: text;
+  user-select: text;
+  touch-action: manipulation;
+}
+
 /* Native HTML <dialog> modal backdrop & centering */
 dialog.sn-dialog {
   margin: auto;

@@ -28,6 +28,14 @@ const BACKUP_FORMAT = 'studynotes-backup';
 const SAFETY_SNAPSHOT_FILENAME = 'pre-restore-backup.studynotes.zip';
 const STREAM_CHUNK_SIZE = 512 * 1024; // 512 KB chunks keep iPad RAM low during big backups
 
+/** Thrown when saving the automatic pre-restore safety backup fails so UI can offer to continue. */
+export class SafetySnapshotError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SafetySnapshotError';
+  }
+}
+
 export interface BackupSizeEstimate {
   estimatedBytes: number;
   metadataBytes: number;
@@ -36,6 +44,11 @@ export interface BackupSizeEstimate {
   noteCount: number;
   pageCount: number;
   assetCount: number;
+}
+
+export interface RestoreResult {
+  manifest: BackupManifest;
+  savedSafetySnapshot: boolean;
 }
 
 export type ExportBackupResult =
@@ -47,7 +60,7 @@ export type ExportBackupResult =
 /** Formats byte counts into readable strings like "1.4 KB", "18.2 MB", or "1.12 GB". */
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
-  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
   const units = ['KB', 'MB', 'GB', 'TB'];
   let value = bytes / 1024;
   let unitIndex = 0;
@@ -59,9 +72,21 @@ export function formatBytes(bytes: number): string {
   return `${value.toFixed(decimals)} ${units[unitIndex]}`;
 }
 
+/** Returns true if the app currently contains any user data worth protecting before a restore. */
+export async function hasExistingDataToProtect(): Promise<boolean> {
+  const [folders, notes, pages, strokes, assets] = await Promise.all([
+    db.folders.count(),
+    db.notes.count(),
+    db.pages.count(),
+    db.strokes.count(),
+    db.assets.count(),
+  ]);
+  return folders + notes + pages + strokes + assets > 0;
+}
+
 /**
  * Estimates the size of the `.studynotes.zip` backup file.
- * - JSON metadata compresses well (~40% of raw UTF-8 size)
+ * - JSON metadata compresses well (~45% of raw UTF-8 size)
  * - PDFs & images are stored at ZIP level 0 (no recompression), so their exact
  *   byteSize is added 1:1 plus ~120 bytes of ZIP header overhead per file.
  */
@@ -97,9 +122,8 @@ export async function estimateBackupSize(): Promise<BackupSizeEstimate> {
  *
  * Memory design for iPad:
  * - `manifest.json` and `database.json` use Deflate (level 6) for compact storage.
- * - Every PDF/photo asset in OPFS uses `ZipPassThrough` (STORE, level 0) so
- *   already-compressed media is never recompressed, and is read in 512 KB chunks
- *   with backpressure between chunks so RAM never spikes.
+ * - Every PDF/photo asset uses `ZipPassThrough` (STORE, level 0) so already-compressed
+ *   media is never recompressed, and is read in 512 KB chunks with backpressure so RAM stays flat.
  */
 async function streamBackupZip(
   onChunk: (chunk: Uint8Array) => Promise<void> | void,
@@ -153,7 +177,6 @@ async function streamBackupZip(
       return;
     }
     if (chunk && chunk.byteLength > 0) {
-      // Copy slice before async write so fflate buffers cannot be mutated underneath us
       const copy = chunk.slice();
       writeChain = writeChain.then(() => onChunk(copy));
     }
@@ -219,7 +242,6 @@ async function streamBackupZip(
   onProgress?.({ phase: 'finalizing', label: 'Backup ready', percent: 100 });
 }
 
-/** Generates a backup file name like `StudyNotes-Backup-2026-11-21.studynotes.zip`. */
 function buildBackupFileName(): string {
   const now = new Date();
   const yyyy = now.getFullYear();
@@ -229,7 +251,7 @@ function buildBackupFileName(): string {
 }
 
 /**
- * Exports all notes, folders, pages, strokes, and OPFS assets into a single
+ * Exports all notes, folders, pages, strokes, and assets into a single
  * `.studynotes.zip` file and opens the iPad Share Sheet (or browser download fallback).
  */
 export async function exportBackupToDevice(
@@ -237,30 +259,19 @@ export async function exportBackupToDevice(
 ): Promise<ExportBackupResult> {
   const fileName = buildBackupFileName();
 
-  // Prefer streaming directly to a temporary OPFS disk file so large backups stay out of RAM
+  // Stream directly into OPFS (via Web Worker) so large backups stay out of RAM
   await clearOpfsDir('exports');
-  const opfsWriter = await createOpfsChunkWriter('exports', fileName);
+  const writer = await createOpfsChunkWriter('exports', fileName);
 
   let backupFile: File;
-
-  if (opfsWriter) {
-    try {
-      await streamBackupZip((chunk) => opfsWriter.write(chunk), onProgress);
-      await opfsWriter.close();
-      const diskFile = await opfsWriter.getFile();
-      // Wrap disk-backed File with explicit ZIP MIME type for iPadOS Share Sheet
-      backupFile = new File([diskFile], fileName, { type: 'application/zip' });
-    } catch (err) {
-      await opfsWriter.abort();
-      throw err;
-    }
-  } else {
-    // Fallback when OPFS isn't available (e.g. private browsing)
-    const chunks: BlobPart[] = [];
-    await streamBackupZip((chunk) => {
-      chunks.push(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength) as ArrayBuffer);
-    }, onProgress);
-    backupFile = new File(chunks, fileName, { type: 'application/zip' });
+  try {
+    await streamBackupZip((chunk) => writer.write(chunk), onProgress);
+    await writer.close();
+    const diskFile = await writer.getFile();
+    backupFile = new File([diskFile], fileName, { type: 'application/zip' });
+  } catch (err) {
+    await writer.abort();
+    throw err;
   }
 
   return shareOrDownloadBackupFile(backupFile);
@@ -277,9 +288,9 @@ export async function shareOrDownloadBackupFile(
 
   if (canUseShareSheet) {
     try {
+      // Pass only `files` (avoiding `title`/`text` avoids known iOS Safari Web Share quirks)
       await navigator.share({
         files: [backupFile],
-        title: 'StudyNotes Backup',
       });
       await setSetting(SETTING_KEYS.lastBackupAt, Date.now());
       return {
@@ -289,12 +300,9 @@ export async function shareOrDownloadBackupFile(
       };
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
-        // User tapped Cancel on the Share Sheet — do NOT mark as backed up
         return { status: 'cancelled' };
       }
       if (err instanceof DOMException && err.name === 'NotAllowedError') {
-        // If building a very large backup took long enough for Safari's user gesture
-        // to expire, return the ready file so Settings can offer a 1-tap Share button.
         return {
           status: 'ready_to_share',
           file: backupFile,
@@ -325,8 +333,8 @@ export async function shareOrDownloadBackupFile(
 }
 
 /**
- * Automatically saves a full safety snapshot of the current device data into OPFS
- * right before a restore runs, allowing one-tap "Undo last restore".
+ * Saves a full safety snapshot of the current device data into OPFS (or IndexedDB
+ * fallback) right before a restore runs, allowing one-tap "Undo last restore".
  */
 async function saveSafetySnapshot(
   onProgress?: (progress: BackupProgress) => void
@@ -337,22 +345,20 @@ async function saveSafetySnapshot(
     percent: 10,
   });
 
-  const writer = await createOpfsChunkWriter('safety', SAFETY_SNAPSHOT_FILENAME);
-  if (!writer) {
-    throw new Error(
-      'Unable to save the pre-restore safety backup in on-device storage.'
-    );
-  }
-
+  let writer: OpfsChunkWriter | null = null;
   try {
-    await streamBackupZip((chunk) => writer.write(chunk));
+    writer = await createOpfsChunkWriter('safety', SAFETY_SNAPSHOT_FILENAME);
+    await streamBackupZip((chunk) => writer!.write(chunk));
     await writer.close();
+    return Date.now();
   } catch (err) {
-    await writer.abort();
-    throw err;
+    if (writer) {
+      await writer.abort().catch(() => {});
+    }
+    const reason =
+      err instanceof Error ? err.message : 'Device storage could not be written.';
+    throw new SafetySnapshotError(reason);
   }
-
-  return Date.now();
 }
 
 /** Checks whether an on-device pre-restore safety snapshot currently exists. */
@@ -386,9 +392,7 @@ export async function inspectBackupFile(file: File): Promise<BackupInspection> {
       entry.start();
     } else if (entry.name === 'database.json') {
       foundDatabase = true;
-      // Don't start() here — we just confirm it exists during inspection
     }
-    // Skip assets/* entries completely during inspection
   });
   unzip.register(UnzipInflate);
 
@@ -433,10 +437,12 @@ export async function inspectBackupFile(file: File): Promise<BackupInspection> {
 
 /**
  * Restores all data from a `.studynotes.zip` file:
- * 1. Saves an automatic pre-restore safety snapshot to OPFS (unless undoing).
- * 2. Streams the ZIP in chunks, writing any PDF/image assets directly to OPFS staging.
+ * 1. If the app currently has data to protect (and skipSafetySnapshot is not set),
+ *    saves an automatic safety snapshot first so a mistaken restore can be undone.
+ *    If the app is empty (e.g. fresh reinstall), skips the unnecessary snapshot.
+ * 2. Streams the ZIP in 512 KB chunks, writing any PDF/image assets to staging.
  * 3. Validates the database dump completely before touching live data.
- * 4. Atomically replaces OPFS assets and IndexedDB tables in one transaction.
+ * 4. Atomically replaces stored assets and IndexedDB tables in one transaction.
  */
 export async function restoreFromBackupFile(
   file: File,
@@ -444,16 +450,19 @@ export async function restoreFromBackupFile(
     skipSafetySnapshot?: boolean;
     onProgress?: (progress: BackupProgress) => void;
   }
-): Promise<BackupManifest> {
+): Promise<RestoreResult> {
   const onProgress = options?.onProgress;
 
-  // Step 1: Save automatic safety snapshot before changing anything
+  // Step 1: Save automatic safety snapshot ONLY if there is existing data to protect
   let safetyTimestamp: number | null = null;
   if (!options?.skipSafetySnapshot) {
-    safetyTimestamp = await saveSafetySnapshot(onProgress);
+    const hasData = await hasExistingDataToProtect();
+    if (hasData) {
+      safetyTimestamp = await saveSafetySnapshot(onProgress);
+    }
   }
 
-  // Step 2: Stream-extract the backup archive (assets go straight to OPFS staging)
+  // Step 2: Stream-extract the backup archive (assets go straight to staging)
   await clearOpfsDir('assets_staging');
 
   const manifestChunks: Uint8Array[] = [];
@@ -488,10 +497,9 @@ export async function restoreFromBackupFile(
 
     if (entry.name.startsWith('assets/') && entry.name.length > 'assets/'.length) {
       const assetId = entry.name.slice('assets/'.length);
-      // Prevent path traversal characters in asset IDs
       if (assetId.includes('/') || assetId.includes('..')) return;
 
-      let writerPromise: Promise<OpfsChunkWriter | null> | null = null;
+      let writerPromise: Promise<OpfsChunkWriter> | null = null;
 
       entry.ondata = (err, data, final) => {
         if (err) {
@@ -504,9 +512,6 @@ export async function restoreFromBackupFile(
             writerPromise = createOpfsChunkWriter('assets_staging', assetId);
           }
           const writer = await writerPromise;
-          if (!writer) {
-            throw new Error('Could not write restored files to device storage.');
-          }
           if (chunkCopy) {
             await writer.write(chunkCopy);
           }
@@ -528,7 +533,6 @@ export async function restoreFromBackupFile(
 
   try {
     await feedFileToUnzip(file, unzip, async (ratio) => {
-      // Wait for staged disk writes after each 512 KB chunk so RAM never grows
       await writeChain;
       if (streamError) throw streamError;
       onProgress?.({
@@ -564,7 +568,7 @@ export async function restoreFromBackupFile(
       throw new Error('Backup data is invalid or incomplete.');
     }
 
-    // Step 4: Commit staged OPFS files and atomically replace IndexedDB tables
+    // Step 4: Commit staged binary assets and atomically replace IndexedDB tables
     onProgress?.({
       phase: 'restoring',
       label: 'Applying restored notes…',
@@ -613,7 +617,10 @@ export async function restoreFromBackupFile(
       percent: 100,
     });
 
-    return manifest;
+    return {
+      manifest,
+      savedSafetySnapshot: safetyTimestamp !== null,
+    };
   } catch (err) {
     await clearOpfsDir('assets_staging');
     throw err;
@@ -629,7 +636,7 @@ export async function undoLastRestore(
     throw new Error('No safety backup is available to undo.');
   }
 
-  const manifest = await restoreFromBackupFile(safetyFile, {
+  const { manifest } = await restoreFromBackupFile(safetyFile, {
     skipSafetySnapshot: true,
     onProgress,
   });

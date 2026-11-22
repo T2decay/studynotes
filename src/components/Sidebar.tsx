@@ -135,7 +135,7 @@ export function Sidebar({
   return (
     <aside
       style={{ width: `${width}px` }}
-      className="relative shrink-0 h-full max-w-[85vw] flex flex-col bg-slate-50 dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800 select-none"
+      className="relative shrink-0 h-full max-w-[85vw] flex flex-col bg-slate-50 dark:bg-slate-900 border-r border-slate-200 dark:border-slate-800"
     >
       {/* Top sidebar header */}
       <div className="safe-top shrink-0 flex items-center justify-between gap-2 px-3 min-h-14 border-b border-slate-200/80 dark:border-slate-800">
@@ -330,7 +330,7 @@ export function Sidebar({
         onPointerUp={handleResizePointerUp}
         onPointerCancel={handleResizePointerUp}
         style={{ touchAction: 'none' }}
-        className={`absolute top-0 right-0 w-3 h-full cursor-col-resize translate-x-1/2 z-10 flex items-center justify-center group ${
+        className={`absolute top-0 right-0 w-3 h-full cursor-col-resize translate-x-1/2 z-10 flex items-center justify-center group select-none ${
           resizing ? 'bg-blue-500/20' : ''
         }`}
       >

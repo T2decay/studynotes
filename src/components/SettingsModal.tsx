@@ -15,9 +15,11 @@ import { APP_VERSION } from '../db/database';
 import { formatLastBackupLabel } from '../db/settings';
 import { getStorageStatus, type StorageStatus } from '../storage/opfs';
 import {
+  SafetySnapshotError,
   estimateBackupSize,
   exportBackupToDevice,
   formatBytes,
+  hasExistingDataToProtect,
   hasSafetySnapshot,
   inspectBackupFile,
   restoreFromBackupFile,
@@ -59,6 +61,7 @@ export function SettingsModal({
   const [estimate, setEstimate] = useState<BackupSizeEstimate | null>(null);
   const [storageStatus, setStorageStatus] = useState<StorageStatus | null>(null);
   const [safetyAvailable, setSafetyAvailable] = useState(false);
+  const [hasCurrentData, setHasCurrentData] = useState(false);
   const [isOnline, setIsOnline] = useState(() => navigator.onLine);
 
   const [busy, setBusy] = useState(false);
@@ -74,17 +77,26 @@ export function SettingsModal({
     file: File;
     inspection: BackupInspection;
   } | null>(null);
+
+  // If saving the automatic safety snapshot fails for any reason, let user choose to continue
+  const [safetyFailurePrompt, setSafetyFailurePrompt] = useState<{
+    file: File;
+    reason: string;
+  } | null>(null);
+
   const [confirmUndoOpen, setConfirmUndoOpen] = useState(false);
 
   const refreshStats = async () => {
-    const [est, status, hasSafety] = await Promise.all([
+    const [est, status, hasSafety, hasData] = await Promise.all([
       estimateBackupSize(),
       getStorageStatus(),
       hasSafetySnapshot(),
+      hasExistingDataToProtect(),
     ]);
     setEstimate(est);
     setStorageStatus(status);
     setSafetyAvailable(hasSafety);
+    setHasCurrentData(hasData);
   };
 
   useEffect(() => {
@@ -186,14 +198,17 @@ export function SettingsModal({
 
   const handlePickRestoreFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    // Reset input so selecting the same file again still triggers onChange
     e.target.value = '';
     if (!file) return;
 
     setBusy(true);
     setStatusMessage(null);
     try {
-      const inspection = await inspectBackupFile(file);
+      const [inspection, hasData] = await Promise.all([
+        inspectBackupFile(file),
+        hasExistingDataToProtect(),
+      ]);
+      setHasCurrentData(hasData);
       setPendingRestore({ file, inspection });
     } catch (err) {
       setStatusMessage({
@@ -208,38 +223,57 @@ export function SettingsModal({
     }
   };
 
-  const handleConfirmRestore = async () => {
-    if (!pendingRestore) return;
-    const { file } = pendingRestore;
-    setPendingRestore(null);
+  const executeRestore = async (file: File, skipSafetySnapshot: boolean) => {
     setBusy(true);
     setStatusMessage(null);
     setProgress({
-      phase: 'safety',
-      label: 'Saving safety backup of current notes…',
+      phase: skipSafetySnapshot ? 'restoring' : 'safety',
+      label: skipSafetySnapshot
+        ? 'Reading backup archive…'
+        : 'Preparing restore…',
       percent: 5,
     });
 
     try {
-      const manifest = await restoreFromBackupFile(file, {
+      const { manifest, savedSafetySnapshot } = await restoreFromBackupFile(file, {
+        skipSafetySnapshot,
         onProgress: (p) => setProgress(p),
       });
       await refreshStats();
       const summary = `Restored ${manifest.counts.folders} folder${manifest.counts.folders === 1 ? '' : 's'} and ${manifest.counts.notes} note${manifest.counts.notes === 1 ? '' : 's'}.`;
-      onRestored(summary, true);
+      onRestored(summary, savedSafetySnapshot);
       onClose();
     } catch (err) {
-      setStatusMessage({
-        tone: 'error',
-        text:
-          err instanceof Error
-            ? err.message
-            : 'Restore failed. Your existing notes were not changed.',
-      });
+      if (err instanceof SafetySnapshotError) {
+        // Explain the failure clearly and let the user choose whether to continue without a safety backup
+        setSafetyFailurePrompt({ file, reason: err.message });
+      } else {
+        setStatusMessage({
+          tone: 'error',
+          text:
+            err instanceof Error
+              ? err.message
+              : 'Restore failed. Your existing notes were not changed.',
+        });
+      }
     } finally {
       setBusy(false);
       setProgress(null);
     }
+  };
+
+  const handleConfirmRestore = async () => {
+    if (!pendingRestore) return;
+    const { file } = pendingRestore;
+    setPendingRestore(null);
+    await executeRestore(file, false);
+  };
+
+  const handleContinueWithoutSafetyBackup = async () => {
+    if (!safetyFailurePrompt) return;
+    const { file } = safetyFailurePrompt;
+    setSafetyFailurePrompt(null);
+    await executeRestore(file, true);
   };
 
   const handleConfirmUndoRestore = async () => {
@@ -483,14 +517,21 @@ export function SettingsModal({
                     On-device usage
                   </span>
                   <span className="font-medium tabular-nums text-slate-900 dark:text-slate-100">
-                    {storageStatus?.usageBytes != null
+                    {storageStatus
                       ? formatBytes(storageStatus.usageBytes)
-                      : 'Unavailable'}
+                      : 'Calculating…'}
                   </span>
                 </div>
 
                 <div className="flex items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400 pt-1 border-t border-slate-200/80 dark:border-slate-800">
-                  <span>StudyNotes v{APP_VERSION}</span>
+                  <span>
+                    StudyNotes v{APP_VERSION} ·{' '}
+                    {storageStatus?.storageBackend === 'opfs'
+                      ? 'OPFS storage'
+                      : storageStatus?.storageBackend === 'indexeddb'
+                        ? 'IndexedDB storage'
+                        : 'Checking storage…'}
+                  </span>
                   <span>All data stays on this iPad</span>
                 </div>
               </div>
@@ -504,7 +545,7 @@ export function SettingsModal({
         open={pendingRestore !== null}
         title="Restore from backup?"
         tone="primary"
-        confirmLabel="Replace & Restore"
+        confirmLabel={hasCurrentData ? 'Replace & Restore' : 'Restore Backup'}
         description={
           pendingRestore && (
             <div className="space-y-2.5">
@@ -536,15 +577,42 @@ export function SettingsModal({
                 </li>
               </ul>
               <p className="text-xs text-slate-500 dark:text-slate-400 pt-1">
-                This will replace the notes currently on this iPad. A safety backup of
-                your current notes will be saved automatically first so you can undo
-                the restore if needed.
+                {hasCurrentData
+                  ? 'This will replace the notes currently on this iPad. A safety backup of your current notes will be saved automatically first so you can undo the restore if needed.'
+                  : 'StudyNotes is currently empty, so this backup will be restored directly.'}
               </p>
             </div>
           )
         }
-        onConfirm={handleConfirmRestore}
+        onConfirm={() => void handleConfirmRestore()}
         onClose={() => setPendingRestore(null)}
+      />
+
+      {/* Fallback prompt if saving the automatic pre-restore safety snapshot fails */}
+      <ConfirmDialog
+        open={safetyFailurePrompt !== null}
+        title="Safety backup could not be saved"
+        tone="danger"
+        confirmLabel="Continue Restore Anyway"
+        description={
+          safetyFailurePrompt && (
+            <div className="space-y-2.5">
+              <p>
+                StudyNotes could not save an automatic safety backup of your current
+                notes before restoring:
+              </p>
+              <p className="rounded-lg bg-slate-100 dark:bg-slate-800 px-3 py-2 text-xs font-mono text-slate-700 dark:text-slate-300">
+                {safetyFailurePrompt.reason}
+              </p>
+              <p>
+                Your existing notes have <strong>not</strong> been changed. You can
+                cancel now, or continue restoring without an automatic undo snapshot.
+              </p>
+            </div>
+          )
+        }
+        onConfirm={() => void handleContinueWithoutSafetyBackup()}
+        onClose={() => setSafetyFailurePrompt(null)}
       />
 
       {/* Confirmation modal before rolling back to the pre-restore safety snapshot */}
@@ -562,7 +630,7 @@ export function SettingsModal({
             .
           </p>
         }
-        onConfirm={handleConfirmUndoRestore}
+        onConfirm={() => void handleConfirmUndoRestore()}
         onClose={() => setConfirmUndoOpen(false)}
       />
     </>

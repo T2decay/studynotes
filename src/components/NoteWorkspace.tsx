@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   FilePlus2,
   Folder as FolderIcon,
   FolderPlus,
   PanelLeft,
+  Pencil,
   Settings,
   Trash2,
 } from 'lucide-react';
@@ -45,6 +46,7 @@ export function NoteWorkspace({
   onMoveNote,
   onRequestDeleteNote,
 }: NoteWorkspaceProps) {
+  const titleInputRef = useRef<HTMLInputElement>(null);
   const [draftTitle, setDraftTitle] = useState(note?.title ?? '');
 
   useEffect(() => {
@@ -60,10 +62,22 @@ export function NoteWorkspace({
     }
   };
 
+  // Synchronous focus inside the tap handler so iPadOS Safari immediately opens the keyboard
+  const handleFocusTitleSync = () => {
+    const input = titleInputRef.current;
+    if (!input) return;
+    input.focus();
+    try {
+      input.setSelectionRange(0, input.value.length);
+    } catch {
+      // Ignore if selection range is unsupported
+    }
+  };
+
   return (
     <main className="flex-1 min-w-0 h-full flex flex-col bg-slate-100 dark:bg-slate-950">
-      {/* Top toolbar */}
-      <header className="safe-top shrink-0 flex items-center gap-2 px-3 sm:px-4 min-h-14 border-b border-slate-200 dark:border-slate-800 bg-white/90 dark:bg-slate-900/90 backdrop-blur">
+      {/* Top toolbar (solid background avoids WebKit standalone PWA backdrop-blur input hit-test quirks) */}
+      <header className="safe-top shrink-0 flex items-center gap-2 px-3 sm:px-4 min-h-14 border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900">
         <button
           type="button"
           onClick={onToggleSidebar}
@@ -76,23 +90,38 @@ export function NoteWorkspace({
 
         {note ? (
           <>
-            <input
-              type="text"
-              value={draftTitle}
-              onChange={(e) => setDraftTitle(e.target.value)}
-              onBlur={commitTitle}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  e.currentTarget.blur();
-                }
-              }}
-              aria-label="Note title"
-              placeholder="Untitled Note"
-              className="flex-1 min-w-0 min-h-10 px-2.5 rounded-xl bg-transparent hover:bg-slate-100 dark:hover:bg-slate-800 focus:bg-white dark:focus:bg-slate-950 focus:outline-none focus:ring-2 focus:ring-blue-500 text-base font-semibold text-slate-900 dark:text-slate-100 truncate"
-            />
+            {/* Always-mounted title input + synchronous focus pencil button for single-tap iPad rename */}
+            <div className="flex-1 min-w-0 flex items-center gap-1">
+              <input
+                ref={titleInputRef}
+                type="text"
+                value={draftTitle}
+                onChange={(e) => setDraftTitle(e.target.value)}
+                onBlur={commitTitle}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.currentTarget.blur();
+                  }
+                }}
+                enterKeyHint="done"
+                autoComplete="off"
+                aria-label="Note title"
+                placeholder="Untitled Note"
+                className="flex-1 min-w-0 min-h-11 px-3 rounded-xl bg-slate-100/70 dark:bg-slate-800/70 hover:bg-slate-100 dark:hover:bg-slate-800 focus:bg-white dark:focus:bg-slate-950 border border-transparent focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-500/30 text-base font-semibold text-slate-900 dark:text-slate-100"
+              />
+              <button
+                type="button"
+                onClick={handleFocusTitleSync}
+                aria-label="Rename note"
+                title="Rename note"
+                className="min-h-11 min-w-11 shrink-0 flex items-center justify-center rounded-xl text-slate-500 dark:text-slate-400 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                <Pencil className="w-4 h-4" />
+              </button>
+            </div>
 
             {/* Folder selector */}
-            <label className="hidden sm:flex items-center gap-1.5 min-h-10 px-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200">
+            <label className="hidden sm:flex items-center gap-1.5 min-h-11 px-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200">
               <FolderIcon className="w-3.5 h-3.5 text-slate-400 shrink-0" />
               <select
                 aria-label="Note folder"
@@ -143,9 +172,9 @@ export function NoteWorkspace({
       {/* Main page area */}
       {note ? (
         <div className="flex-1 overflow-y-auto p-4 sm:p-8 flex flex-col items-center">
-          {/* Mobile/narrow folder picker */}
+          {/* Narrow viewport folder picker */}
           <div className="sm:hidden w-full max-w-[680px] mb-3 flex items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
-            <label className="flex items-center gap-1.5 min-h-9 px-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+            <label className="flex items-center gap-1.5 min-h-10 px-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
               <FolderIcon className="w-3.5 h-3.5" />
               <select
                 aria-label="Note folder"
